@@ -1,12 +1,122 @@
-import random
 import asyncio
+import os
+import random
+from base64 import b64encode
+from hashlib import sha1
 from logging import getLogger
 
-from rpcudp.protocol import RPCProtocol
+import umsgpack
 
 from .node import Node
 from .routing import RoutingTable
 from .utils import digest
+
+log = getLogger('rpcudp')
+
+
+class MalformedMessage(Exception):
+    """
+    Message does not contain what is expected.
+    """
+
+
+class RPCProtocol(asyncio.DatagramProtocol):
+    def __init__(self, wait_timeout=10):
+        """
+        @param wait_timeout: Consider it a connetion failure if no response
+        within this time window.
+        """
+        self._wait_timeout = wait_timeout
+        self._outstanding = {}
+
+    # noinspection PyAttributeOutsideInit
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, datagram, address):
+        log.debug("received datagram from %s", address)
+        asyncio.ensure_future(self._solve_datagram(datagram, address))
+
+    @asyncio.coroutine
+    def _solve_datagram(self, datagram, address):
+        if len(datagram) < 22:
+            log.warning("received datagram too small from %s, ignoring", address)
+            return
+
+        msg_id = datagram[1:21]
+        data = umsgpack.unpackb(datagram[21:])
+
+        if datagram[:1] == b'\x00':
+            # schedule accepting request and returning the result
+            asyncio.ensure_future(self._accept_request(msg_id, data, address))
+        elif datagram[:1] == b'\x01':
+            self._accept_response(msg_id, data, address)
+        else:
+            # otherwise, don't know the format, don't do anything
+            log.debug("Received unknown message from %s, ignoring", address)
+
+    def _accept_response(self, msg_id, data, address):
+        msgargs = (b64encode(msg_id), address)
+        if msg_id not in self._outstanding:
+            log.warning("received unknown message %s from %s; ignoring", *msgargs)
+            return
+        log.debug("received response %s for message id %s from %s", data, *msgargs)
+        f, timeout = self._outstanding[msg_id]
+        timeout.cancel()
+        f.set_result((True, data))
+        del self._outstanding[msg_id]
+
+    @asyncio.coroutine
+    def _accept_request(self, msg_id, data, address):
+        if not isinstance(data, list) or len(data) != 2:
+            raise MalformedMessage("Could not read packet: %s" % data)
+        funcname, args = data
+        f = getattr(self, "rpc_%s" % funcname, None)
+        if f is None or not callable(f):
+            msgargs = (self.__class__.__name__, funcname)
+            log.warning("%s has no callable method rpc_%s; ignoring request", *msgargs)
+            return
+
+        if not asyncio.iscoroutinefunction(f):
+            f = asyncio.coroutine(f)
+        response = yield from f(address, *args)
+        log.debug("sending response %s for msg id %s to %s", response, b64encode(msg_id), address)
+        txdata = b'\x01' + msg_id + umsgpack.packb(response)
+        self.transport.sendto(txdata, address)
+
+    def _timeout(self, msg_id):
+        args = (b64encode(msg_id), self._wait_timeout)
+        log.error("Did not received reply for msg id %s within %i seconds", *args)
+        self._outstanding[msg_id][0].set_result((False, None))
+        del self._outstanding[msg_id]
+
+    # noinspection PyUnresolvedReferences
+    def __getattr__(self, name):
+        if name.startswith("_") or name.startswith("rpc_"):
+            return object.__getattr__(self, name)
+
+        try:
+            return object.__getattr__(self, name)
+        except AttributeError:
+            pass
+
+        def func(address, *args):
+            msg_id = sha1(os.urandom(32)).digest()
+            data = umsgpack.packb([name, args])
+            if len(data) > 8192:
+                msg = "Total length of function name and arguments cannot exceed 8K"
+                raise MalformedMessage(msg)
+            txdata = b'\x00' + msg_id + data
+            log.debug("calling remote function %s on %s (msgid %s)", name, address, b64encode(msg_id))
+            self.transport.sendto(txdata, address)
+
+            loop = asyncio.get_event_loop()
+            f = loop.create_future() if hasattr(loop, 'create_future') else asyncio.Future()
+            timeout = loop.call_later(self._wait_timeout, self._timeout, msg_id)
+            self._outstanding[msg_id] = (f, timeout)
+            return f
+
+        return func
 
 
 class KademliaProtocol(RPCProtocol):
