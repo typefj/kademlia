@@ -4,16 +4,20 @@ import heapq
 
 class Node(object):
     def __init__(self, nid, ip=None, port=None):
-        self.nid = nid
+        self.nid = nid.encode('latin1') if not isinstance(nid, bytes) else nid
         self.ip = ip
         self.port = port
-        self.long_id = int(nid.hex(), 16)
+        self.long_id = int(self.nid.hex(), 16)
 
     def same_home_as(self, node):
         return self.ip == node.ip and self.port == node.port
 
     def distance(self, node):
         return self.long_id ^ node.long_id
+
+    @property
+    def str_nid(self):
+        return self.nid.decode('latin1')
 
     def __iter__(self):
         return iter([self.nid, self.ip, self.port])

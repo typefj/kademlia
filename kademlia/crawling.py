@@ -1,8 +1,7 @@
-from collections import Counter
 from logging import getLogger
 
 from .node import Node, NodeHeap
-from .utils import gather_dict
+from .utils import gather_dict, decode_nodes
 
 
 class SpiderCrawl(object):
@@ -56,10 +55,13 @@ class SpiderCrawl(object):
 
         ds = {}
         for peer in self.nearest.get_uncontacted()[:count]:
-            ds[peer.id] = rpcmethod(peer, self.node)
+            ds[peer.nid] = rpcmethod(peer, self.node)
             self.nearest.mark_contacted(peer)
         found = await gather_dict(ds)
         return await self._nodes_found(found)
+
+    async def _nodes_found(self, found):
+        raise NotImplementedError()
 
 
 class ValueSpiderCrawl(SpiderCrawl):
@@ -73,7 +75,7 @@ class ValueSpiderCrawl(SpiderCrawl):
         """
         Find either the closest nodes or the value requested.
         """
-        return await self._find(self.protocol.call_find_value)
+        return await self._find(self.protocol.call_get_peers)
 
     async def _nodes_found(self, responses):
         """
@@ -107,16 +109,18 @@ class ValueSpiderCrawl(SpiderCrawl):
         make sure we tell the nearest node that *didn't* have
         the value to store it.
         """
-        value_counts = Counter(values)
-        if len(value_counts) != 1:
-            args = (self.node.long_id, str(values))
-            self.log.warning("Got multiple values for key %i: %s" % args)
-        value = value_counts.most_common(1)[0][0]
 
-        peer_to_save_to = self.nearest_without_value.popleft()
-        if peer_to_save_to is not None:
-            await self.protocol.call_store(peer_to_save_to, self.node.id, value)
-        return value
+        # value_counts = Counter(values)
+        # if len(value_counts) != 1:
+        #     args = (self.node.long_id, str(values))
+        #     self.log.warning("Got multiple values for key %i: %s" % args)
+        # value = value_counts.most_common(1)[0][0]
+        #
+        # peer_to_save_to = self.nearest_without_value.popleft()
+        # if peer_to_save_to is not None:
+        #     await self.protocol.call_store(peer_to_save_to, self.node.nid, value)
+        #
+        return values
 
 
 class NodeSpiderCrawl(SpiderCrawl):
@@ -141,7 +145,7 @@ class NodeSpiderCrawl(SpiderCrawl):
 
         if self.nearest.all_been_contacted():
             return list(self.nearest)
-        return self.find()
+        return await self.find()
 
 
 class RPCFindResponse(object):
@@ -163,15 +167,17 @@ class RPCFindResponse(object):
         return self.response[0]
 
     def has_value(self):
-        return isinstance(self.response[1], dict)
+        return isinstance(self.response[1], dict) and ('values' in self.response[1]['r'])
 
     def get_value(self):
-        return self.response[1]['value']
+        return self.response[1]['r']['values']
 
     def get_node_list(self):
         """
         Get the node list in the response.  If there's no value, this should
         be set.
         """
-        nodelist = self.response[1] or []
-        return [Node(*nodeple) for nodeple in nodelist]
+        if 'nodes' not in self.response[1]['r']:
+            return []
+        nodes = decode_nodes(self.response[1]['r']['nodes'])
+        return [Node(*nodeple) for nodeple in nodes]

@@ -1,27 +1,18 @@
 import asyncio
-import os
 import random
-from base64 import b64encode
-from hashlib import sha1
 from logging import getLogger
-
-import umsgpack
+import os
+from bencode import bencode, bdecode, BTFailure
 
 from .node import Node
 from .routing import RoutingTable
-from .utils import digest
+from .utils import digest, encode_nodes
 
 log = getLogger('rpcudp')
 
 
-class MalformedMessage(Exception):
-    """
-    Message does not contain what is expected.
-    """
-
-
 class RPCProtocol(asyncio.DatagramProtocol):
-    def __init__(self, wait_timeout=10):
+    def __init__(self, wait_timeout=5):
         """
         @param wait_timeout: Consider it a connetion failure if no response
         within this time window.
@@ -35,28 +26,28 @@ class RPCProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, datagram, address):
         log.debug("received datagram from %s", address)
-        asyncio.ensure_future(self._solve_datagram(datagram, address))
+        try:
+            data = bdecode(datagram.decode('latin1'))
+        except BTFailure as e:
+            log.warning('decode data failure. {}'.format(e))
+        else:
+            asyncio.ensure_future(self._solve_datagram(data, address))
 
     @asyncio.coroutine
-    def _solve_datagram(self, datagram, address):
-        if len(datagram) < 22:
-            log.warning("received datagram too small from %s, ignoring", address)
-            return
-
-        msg_id = datagram[1:21]
-        data = umsgpack.unpackb(datagram[21:])
-
-        if datagram[:1] == b'\x00':
+    def _solve_datagram(self, data, address):
+        msg_id = data['t']
+        y = data['y']
+        if y == 'q':
             # schedule accepting request and returning the result
             asyncio.ensure_future(self._accept_request(msg_id, data, address))
-        elif datagram[:1] == b'\x01':
+        elif y == 'r':
             self._accept_response(msg_id, data, address)
         else:
             # otherwise, don't know the format, don't do anything
-            log.debug("Received unknown message from %s, ignoring", address)
+            log.debug("Received unknown message from {}, ignoring. data: {}".format(address, data))
 
     def _accept_response(self, msg_id, data, address):
-        msgargs = (b64encode(msg_id), address)
+        msgargs = (msg_id, address)
         if msg_id not in self._outstanding:
             log.warning("received unknown message %s from %s; ignoring", *msgargs)
             return
@@ -68,9 +59,7 @@ class RPCProtocol(asyncio.DatagramProtocol):
 
     @asyncio.coroutine
     def _accept_request(self, msg_id, data, address):
-        if not isinstance(data, list) or len(data) != 2:
-            raise MalformedMessage("Could not read packet: %s" % data)
-        funcname, args = data
+        funcname = data['q']
         f = getattr(self, "rpc_%s" % funcname, None)
         if f is None or not callable(f):
             msgargs = (self.__class__.__name__, funcname)
@@ -79,13 +68,12 @@ class RPCProtocol(asyncio.DatagramProtocol):
 
         if not asyncio.iscoroutinefunction(f):
             f = asyncio.coroutine(f)
-        response = yield from f(address, *args)
-        log.debug("sending response %s for msg id %s to %s", response, b64encode(msg_id), address)
-        txdata = b'\x01' + msg_id + umsgpack.packb(response)
-        self.transport.sendto(txdata, address)
+        response = yield from f(address, data)
+        log.debug("sending response %s for msg id %s to %s", response, msg_id, address)
+        self.transport.sendto(bencode(response).encode('latin1'), address)
 
     def _timeout(self, msg_id):
-        args = (b64encode(msg_id), self._wait_timeout)
+        args = (msg_id, self._wait_timeout)
         log.error("Did not received reply for msg id %s within %i seconds", *args)
         self._outstanding[msg_id][0].set_result((False, None))
         del self._outstanding[msg_id]
@@ -100,23 +88,21 @@ class RPCProtocol(asyncio.DatagramProtocol):
         except AttributeError:
             pass
 
-        def func(address, *args):
-            msg_id = sha1(os.urandom(32)).digest()
-            data = umsgpack.packb([name, args])
-            if len(data) > 8192:
-                msg = "Total length of function name and arguments cannot exceed 8K"
-                raise MalformedMessage(msg)
-            txdata = b'\x00' + msg_id + data
-            log.debug("calling remote function %s on %s (msgid %s)", name, address, b64encode(msg_id))
-            self.transport.sendto(txdata, address)
 
-            loop = asyncio.get_event_loop()
-            f = loop.create_future() if hasattr(loop, 'create_future') else asyncio.Future()
-            timeout = loop.call_later(self._wait_timeout, self._timeout, msg_id)
-            self._outstanding[msg_id] = (f, timeout)
-            return f
+def kprc_q(func):
+    def method(self, *args, **kwargs):
+        address, msg = func(self, *args, **kwargs)
+        msg_id = msg['t']
 
-        return func
+        log.debug("calling remote function %s on %s (msgid %s)", func.__name__, address, msg_id)
+        self.transport.sendto(bencode(msg).encode('latin1'), address)
+        loop = asyncio.get_event_loop()
+        f = loop.create_future() if hasattr(loop, 'create_future') else asyncio.Future()
+        timeout = loop.call_later(self._wait_timeout, self._timeout, msg_id)
+        self._outstanding[msg_id] = (f, timeout)
+        return f
+
+    return method
 
 
 class KademliaProtocol(RPCProtocol):
@@ -127,6 +113,14 @@ class KademliaProtocol(RPCProtocol):
         self.source_node = source_node
         self.log = getLogger("kademlia-protocol")
 
+    @property
+    def tid(self):
+        return os.urandom(2)
+
+    @property
+    def gen_token(self):
+        return os.urandom(4)
+
     def iter_refresh_ids(self):
         for bucket in self.router.get_lonely_buckets():
             yield random.randint(*bucket.range).to_bytes(20, byteorder='big')
@@ -134,10 +128,16 @@ class KademliaProtocol(RPCProtocol):
     def rpc_stun(self, sender):
         return sender
 
-    def rpc_ping(self, sender, nodeid):
+    def rpc_ping(self, sender, data):
+        nodeid = data['a']['id']
         source = Node(nodeid, sender[0], sender[1])
         self.welcome_new_node(source)
-        return self.source_node.nid
+        return {"t": data['t'], "y": "r", "q": "ping", "a": {"id": self.source_node.str_nid}}
+
+    @kprc_q
+    def ping(self, address, node):
+        msg = {"t": self.tid.hex(), "y": "q", "q": "ping", "a": {"id": node.str_nid}}
+        return address, msg
 
     def rpc_store(self, sender, nodeid, key, value):
         source = Node(nodeid, sender[0], sender[1])
@@ -146,34 +146,61 @@ class KademliaProtocol(RPCProtocol):
         self.storage[key] = value
         return True
 
-    def rpc_find_node(self, sender, nodeid, key):
-        self.log.info("finding neighbors of %i in local table" % int(nodeid.hex(), 16))
-        source = Node(nodeid, sender[0], sender[1])
+    def rpc_find_node(self, sender, data):
+        target = data['a']['target']
+        source_id = data['a']['id']
+        self.log.info("finding neighbors of {} in local table".format(target))
+        source = Node(source_id, sender[0], sender[1])
         self.welcome_new_node(source)
-        node = Node(key)
-        return list(map(tuple, self.router.find_neighbors(node, exclude=source)))
+        node = Node(target)
+        node_list = list(map(tuple, self.router.find_neighbors(node, exclude=source)))
+        msg = {'r': {'id': self.source_node.str_nid, 'nodes': encode_nodes(node_list)}, 't': data['t'], 'y': 'r'}
+        return msg
 
-    def rpc_find_value(self, sender, nodeid, key):
-        source = Node(nodeid, sender[0], sender[1])
+    @kprc_q
+    def find_node(self, address, target):
+        msg = {
+            't': self.tid.hex(),
+            'y': 'q',
+            'q': 'find_node',
+            'a': {
+                'id': self.source_node.str_nid,
+                'target': target.str_nid
+            }
+        }
+        return address, msg
+
+    @kprc_q
+    def get_peers(self, address, info_hash):
+        msg = {"t": self.tid.hex(), "y": "q", "q": "get_peers",
+               "a": {"id": self.source_node.str_nid, "info_hash": info_hash}}
+        return address, msg
+
+    def rpc_get_peers(self, sender, data):
+        source = Node(data['a']['id'], sender[0], sender[1])
         self.welcome_new_node(source)
-        value = self.storage.get(key, None)
-        if value is None:
-            return self.rpc_find_node(sender, nodeid, key)
-        return {'value': value}
+        # value = self.storage.get(key, None)
+        # if value is None:
+        #     return self.rpc_find_node(sender, nodeid, key)
+        # return {'value': value}
+        node = Node(data['a']['info_hash'])
+        node_list = list(map(tuple, self.router.find_neighbors(node, exclude=source)))
+        return {"t": data['t'], "y": "r",
+                "r": {"id": self.source_node.str_nid, "token": self.gen_token.hex(), "nodes": encode_nodes(node_list)}}
 
     async def call_find_node(self, node_to_ask, node_to_find):
         address = (node_to_ask.ip, node_to_ask.port)
-        result = await self.find_node(address, self.source_node.nid, node_to_find.nid)
+        result = await self.find_node(address, node_to_find)
         return self.handle_call_response(result, node_to_ask)
 
-    async def call_find_value(self, node_to_ask, node_to_find):
+    async def call_get_peers(self, node_to_ask, node_to_find):
         address = (node_to_ask.ip, node_to_ask.port)
-        result = await self.find_value(address, self.source_node.nid, node_to_find.nid)
+        result = await self.get_peers(address, node_to_find.str_nid)
         return self.handle_call_response(result, node_to_ask)
 
     async def call_ping(self, node_to_ask):
         address = (node_to_ask.ip, node_to_ask.port)
-        result = await self.ping(address, self.source_node.nid)
+        result = await self.ping(address, self.source_node)
         return self.handle_call_response(result, node_to_ask)
 
     async def call_store(self, node_to_ask, key, value):

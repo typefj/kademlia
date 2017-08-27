@@ -110,8 +110,9 @@ class Server(object):
         return await spider.find()
 
     async def bootstrap_node(self, addr):
-        result = await self.protocol.ping(addr, self.node.nid)
-        return Node(result[1], addr[0], addr[1]) if result[0] else None
+        result = await self.protocol.ping(addr, self.node)
+        is_success, data = result
+        return Node(data['r']['id'], addr[0], addr[1]) if is_success else None
 
     def inet_visible_ip(self):
         """
@@ -138,7 +139,7 @@ class Server(object):
         Returns:
             :class:`None` if not found, the value otherwise.
         """
-        dkey = digest(key)
+        dkey = key if isinstance(key, bytes) else bytes.fromhex(key)
         # if this node has it, return it
         if self.storage.get(dkey) is not None:
             return self.storage.get(dkey)
