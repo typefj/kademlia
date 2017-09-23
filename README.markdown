@@ -2,6 +2,5 @@
 
 A bittorrent DHT in Python asyncio.
 
-
-## Still in development...
+Still in development...
 
